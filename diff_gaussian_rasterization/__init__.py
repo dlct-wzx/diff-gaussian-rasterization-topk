@@ -41,6 +41,29 @@ def rasterize_gaussians(
         raster_settings,
     )
 
+def rasterize_gaussians_with_contributors(
+    means3D,
+    means2D,
+    sh,
+    colors_precomp,
+    opacities,
+    scales,
+    rotations,
+    cov3Ds_precomp,
+    raster_settings,
+):
+    return _RasterizeGaussiansWithContributors.apply(
+        means3D,
+        means2D,
+        sh,
+        colors_precomp,
+        opacities,
+        scales,
+        rotations,
+        cov3Ds_precomp,
+        raster_settings,
+    )
+
 class _RasterizeGaussians(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -154,6 +177,66 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         return grads
 
+class _RasterizeGaussiansWithContributors(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        means3D,
+        means2D,
+        sh,
+        colors_precomp,
+        opacities,
+        scales,
+        rotations,
+        cov3Ds_precomp,
+        raster_settings,
+    ):
+        # Restructure arguments the way that the C++ lib expects them
+        args = (
+            raster_settings.bg, 
+            means3D,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            raster_settings.scale_modifier,
+            cov3Ds_precomp,
+            raster_settings.viewmatrix,
+            raster_settings.projmatrix,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            sh,
+            raster_settings.sh_degree,
+            raster_settings.campos,
+            raster_settings.prefiltered,
+            raster_settings.debug
+        )
+
+        # Invoke C++/CUDA rasterizer with contributor tracking
+        if raster_settings.debug:
+            cpu_args = cpu_deep_copy_tuple(args)
+            try:
+                num_rendered, color, radii, max_contributors, contribution_weights, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians_with_contributors(*args)
+            except Exception as ex:
+                torch.save(cpu_args, "snapshot_fw_contrib.dump")
+                print("\nAn error occured in forward with contributors. Please forward snapshot_fw_contrib.dump for debugging.")
+                raise ex
+        else:
+            num_rendered, color, radii, max_contributors, contribution_weights, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians_with_contributors(*args)
+
+        # Keep relevant tensors for backward
+        ctx.raster_settings = raster_settings
+        ctx.num_rendered = num_rendered
+        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
+        
+        return color, radii, max_contributors, contribution_weights
+
+    @staticmethod
+    def backward(ctx, grad_out_color, _, grad_max_contributors, grad_contribution_weights):
+        pass
+
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
     image_width: int 
@@ -208,6 +291,49 @@ class GaussianRasterizer(nn.Module):
 
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians(
+            means3D,
+            means2D,
+            shs,
+            colors_precomp,
+            opacities,
+            scales, 
+            rotations,
+            cov3D_precomp,
+            raster_settings, 
+        )
+
+    def forward_with_contributors(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
+        """
+        渲染并返回每个像素中贡献最大的高斯椭球索引和贡献权重
+        
+        返回:
+            color: 渲染图像 (3, H, W)
+            radii: 高斯椭球的半径 (N,)
+            max_contributors: 每个像素贡献最大的高斯椭球索引 (H, W)
+            contribution_weights: 每个像素最大贡献的权重 (H, W)
+        """
+        raster_settings = self.raster_settings
+
+        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
+            raise Exception('Please provide excatly one of either SHs or precomputed colors!')
+        
+        if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
+            raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
+        
+        if shs is None:
+            shs = torch.Tensor([])
+        if colors_precomp is None:
+            colors_precomp = torch.Tensor([])
+
+        if scales is None:
+            scales = torch.Tensor([])
+        if rotations is None:
+            rotations = torch.Tensor([])
+        if cov3D_precomp is None:
+            cov3D_precomp = torch.Tensor([])
+
+        # Invoke C++/CUDA rasterization routine with contributor tracking
+        return rasterize_gaussians_with_contributors(
             means3D,
             means2D,
             shs,

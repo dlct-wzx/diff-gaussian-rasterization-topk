@@ -60,6 +60,21 @@ namespace FORWARD
 		uint32_t* n_contrib,
 		const float* bg_color,
 		float* out_color);
+	// 新增的renderWithContributors函数
+	void renderWithContributors(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H,
+		const float2* means2D,
+		const float* colors,
+		const float4* conic_opacity,
+		float* final_T,
+		uint32_t* n_contrib,
+		uint32_t* max_contributor_id,		// 新增：存储最大贡献者ID
+		float* max_contribution_weight,		// 新增：存储最大贡献权重
+		const float* bg_color,
+		float* out_color);
 }
 
 
