@@ -373,6 +373,173 @@ renderCUDA(
 	}
 }
 
+// 修改后的渲染函数，追踪topk贡献者
+template <uint32_t CHANNELS, uint32_t K>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+renderCUDAWithTopKContributors(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	const float2* __restrict__ points_xy_image,
+	const float* __restrict__ features,
+	const float4* __restrict__ conic_opacity,
+	float* __restrict__ final_T,
+	uint32_t* __restrict__ n_contrib,
+	int* __restrict__ topk_contributor_ids,  // 新增：每个像素的topk贡献者ID [H*W*K]
+	float* __restrict__ topk_contribution_weights, // 新增：topk贡献权重 [H*W*K]
+	const float* __restrict__ bg_color,
+	float* __restrict__ out_color)
+{
+	// Identify current tile and associated min/max pixel range.
+	auto block = cg::this_thread_block();
+	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	uint32_t pix_id = W * pix.y + pix.x;
+	float2 pixf = { (float)pix.x, (float)pix.y };
+
+	// Check if this thread is associated with a valid pixel or outside.
+	bool inside = pix.x < W&& pix.y < H;
+	// Done threads can help with fetching, but don't rasterize
+	bool done = !inside;
+
+	// Load start/end range of IDs to process in bit sorted list.
+	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	int toDo = range.y - range.x;
+
+	// Allocate storage for batches of collectively fetched data.
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+
+	// Initialize helper variables
+	float T = 1.0f;
+	uint32_t contributor = 0;
+	uint32_t last_contributor = 0;
+	float C[CHANNELS] = { 0 };
+	
+	// 新增：追踪topk贡献者的变量
+	int topk_ids[K];
+	float topk_weights[K];
+	uint32_t topk_count = 0;
+	
+	// 初始化topk数组
+	for (int k = 0; k < K; k++) {
+		topk_ids[k] = 0;
+		topk_weights[k] = 0.0f;
+	}
+
+	// Iterate over batches until all done or range is complete
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		// End if entire block votes that it is done rasterizing
+		int num_done = __syncthreads_count(done);
+		if (num_done == BLOCK_SIZE)
+			break;
+
+		// Collectively fetch per-Gaussian data from global to shared
+		int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			int coll_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+		}
+		block.sync();
+
+		// Iterate over current batch
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			contributor++;
+
+			// Resample using conic matrix (cf. "Surface 
+			// Splatting" by Zwicker et al., 2001)
+			float2 xy = collected_xy[j];
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			float4 con_o = collected_conic_opacity[j];
+			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			// Eq. (2) from 3D Gaussian splatting paper.
+			// Obtain alpha by multiplying with Gaussian opacity
+			// and its exponential falloff from mean.
+			// Avoid numerical instabilities (see paper appendix). 
+			float alpha = min(0.99f, con_o.w * exp(power));
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			float test_T = T * (1 - alpha);
+			if (test_T < 0.0001f)
+			{
+				done = true;
+				continue;
+			}
+
+			// 计算当前高斯椭球的贡献权重
+			float contribution_weight = alpha * T;
+			
+			// 更新topk贡献者列表
+			uint32_t current_id = collected_id[j];
+			
+			// 查找插入位置
+			int insert_pos = -1;
+			for (int k = 0; k < K; k++) {
+				if (k >= topk_count || contribution_weight > topk_weights[k]) {
+					insert_pos = k;
+					break;
+				}
+			}
+			
+			// 如果找到插入位置，更新topk列表
+			if (insert_pos != -1) {
+				// 向后移动较小的元素
+				for (int k = min((int)topk_count, K-1); k > insert_pos; k--) {
+					if (k < K) {
+						topk_ids[k] = topk_ids[k-1];
+						topk_weights[k] = topk_weights[k-1];
+					}
+				}
+				
+				// 插入新元素
+				topk_ids[insert_pos] = current_id;
+				topk_weights[insert_pos] = contribution_weight;
+				
+				// 更新计数
+				if (topk_count < K) {
+					topk_count++;
+				}
+			}
+
+			// Eq. (3) from 3D Gaussian splatting paper.
+			for (int ch = 0; ch < CHANNELS; ch++)
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * contribution_weight;
+
+			T = test_T;
+			last_contributor = contributor;
+		}
+	}
+
+	// All threads that treat valid pixel write out their final
+	// rendering data to the frame and auxiliary buffers.
+	if (inside)
+	{
+		final_T[pix_id] = T;
+		n_contrib[pix_id] = last_contributor;
+		
+		// 写入topk贡献者信息
+		for (int k = 0; k < K; k++) {
+			topk_contributor_ids[pix_id * K + k] = topk_ids[k];
+			topk_contribution_weights[pix_id * K + k] = topk_weights[k];
+		}
+		
+		for (int ch = 0; ch < CHANNELS; ch++)
+			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+	}
+}
+
 void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
@@ -452,4 +619,35 @@ void FORWARD::preprocess(int P, int D, int M,
 		tiles_touched,
 		prefiltered
 		);
+}
+
+// 新增的FORWARD函数 - topk版本
+void FORWARD::renderWithTopKContributors(
+	const dim3 grid, dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int W, int H,
+	const float2* means2D,
+	const float* colors,
+	const float4* conic_opacity,
+	float* final_T,
+	uint32_t* n_contrib,
+	int* topk_contributor_ids,
+	float* topk_contribution_weights,
+	const float* bg_color,
+	float* out_color)
+{
+	renderCUDAWithTopKContributors<NUM_CHANNELS, TOPK_CONTRIBUTORS> << <grid, block >> > (
+		ranges,
+		point_list,
+		W, H,
+		means2D,
+		colors,
+		conic_opacity,
+		final_T,
+		n_contrib,
+		topk_contributor_ids,
+		topk_contribution_weights,
+		bg_color,
+		out_color);
 }

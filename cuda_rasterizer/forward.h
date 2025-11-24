@@ -60,6 +60,20 @@ namespace FORWARD
 		uint32_t* n_contrib,
 		const float* bg_color,
 		float* out_color);
+	void renderWithTopKContributors(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H,
+		const float2* means2D,
+		const float* colors,
+		const float4* conic_opacity,
+		float* final_T,
+		uint32_t* n_contrib,
+		int* topk_contributor_ids,
+		float* topk_contribution_weights,	
+		const float* bg_color,
+		float* out_color);
 }
 
 
