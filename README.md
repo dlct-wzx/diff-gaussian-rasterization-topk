@@ -41,6 +41,11 @@ This fork remains API-compatible with the original rasterizer, but adds the func
 3.  The global Top-K count is controlled via `cuda_rasterizer/config.h` (`TOPK_CONTRIBUTORS`). Adjust that value and rebuild to change how many contributors are recorded.
 4.  No other code changes are required; all existing training/inference scripts continue to run unchanged.
 
+## Implementation Details
+This fork adds a secondary kernel renderCUDAWithTopKContributors in rasterizer_impl.cu. While accumulating color, it maintains a fixed-size sorted array in local memory for each pixel to track the Gaussians with the highest alpha * T values.
+
+The gradients for topk_contributors and topk_weights are currently not implemented (returning None), as this feature is primarily intended for analysis and forward-pass filtering, not for backpropagating into the selection logic itself. The standard gradients for colors, means, etc., are preserved.
+
 ## Citation
 
 If you use this customized version, please still cite the original work:
